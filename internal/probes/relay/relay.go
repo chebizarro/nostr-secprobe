@@ -148,6 +148,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Evidence: map[string]any{"event_id": ev.ID, "relay": url, "status": st2, "error": errString(err2)},
 				Mitigations: []string{"Track seen event IDs and reject duplicates"},
 				Timestamp: time.Now().UTC(),
+				Active: true,
 			})
 		}
 	}
@@ -168,6 +169,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Evidence: map[string]any{"event_id": bad.ID, "relay": url, "status": st3, "error": errString(err3)},
 				Mitigations: []string{"Verify Schnorr signatures and reject invalid events"},
 				Timestamp: time.Now().UTC(),
+				Active: true,
 			})
 		}
 	}
@@ -179,20 +181,44 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 		for _, url := range opt.Targets {
 			sent := 0
 			fails := 0
+			var durs []time.Duration
 			for i := 0; i < burstN; i++ {
 				e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
 				if err := e.Sign(sk); err != nil { fails++; continue }
+				t0 := time.Now()
 				st, err := client.PublishWithAck(ctx, url, &e)
+				durs = append(durs, time.Since(t0))
 				if err != nil || st == nil || !st.Success { fails++ } else { sent++ }
 			}
+			// compute simple stats in milliseconds
+			ms := func(d time.Duration) float64 { return float64(d.Milliseconds()) }
+			var min, max time.Duration
+			var sum time.Duration
+			if len(durs) > 0 { min, max = durs[0], durs[0] }
+			for _, d := range durs {
+				if d < min { min = d }
+				if d > max { max = d }
+				sum += d
+			}
+			avg := time.Duration(0)
+			if len(durs) > 0 { avg = time.Duration(int64(sum) / int64(len(durs))) }
 			r.Add(report.Finding{
 				Name: "Rate limiting / burst behavior (informational)",
 				Category: "Rate limiting",
 				Severity: report.Low,
 				Status: report.Inconclusive,
-				Evidence: map[string]any{"relay": url, "attempted": burstN, "sent": sent, "failures": fails},
+				Evidence: map[string]any{
+					"relay": url,
+					"attempted": burstN,
+					"sent": sent,
+					"failures": fails,
+					"latency_ms_min": ms(min),
+					"latency_ms_avg": ms(avg),
+					"latency_ms_max": ms(max),
+				},
 				Mitigations: []string{"Enforce per-pubkey/per-IP rate limiting and provide clear backpressure responses"},
 				Timestamp: time.Now().UTC(),
+				Active: true,
 			})
 		}
 	}
@@ -213,6 +239,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Evidence: map[string]any{"relay": url, "status": stpk, "error": errString(errpk)},
 				Mitigations: []string{"Validate pubkey encoding and signature binding"},
 				Timestamp: time.Now().UTC(),
+				Active: true,
 			})
 
 			// 2) Invalid kind (negative), properly signed
@@ -229,6 +256,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					Evidence: map[string]any{"relay": url, "status": stk, "error": errString(errk)},
 					Mitigations: []string{"Enforce valid kind ranges per policy"},
 					Timestamp: time.Now().UTC(),
+					Active: true,
 				})
 			}
 
@@ -250,6 +278,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					Evidence: map[string]any{"relay": url, "size_bytes": len(big), "status": stb, "error": errString(errb)},
 					Mitigations: []string{"Document and enforce reasonable content size limits"},
 					Timestamp: time.Now().UTC(),
+					Active: true,
 				})
 			}
 
@@ -273,8 +302,50 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 						Evidence: map[string]any{"relay": url, "error": errString(qerr)},
 						Mitigations: []string{"Validate filters and avoid processing invalid IDs/kinds"},
 						Timestamp: time.Now().UTC(),
+						Active: true,
 					})
 				}()
+			}
+
+			// 5) Future timestamp policy
+			future := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Timestamp(time.Now().Add(48 * time.Hour).Unix()), Kind: gonostr.KindTextNote, Content: "secprobe future timestamp"}
+			if err := future.Sign(sk); err == nil {
+				stf, errf := client.PublishWithAck(ctx, url, &future)
+				// Relay policy-dependent: if rejected, PASS; if accepted, INCONCLUSIVE
+				rejectedF := errf == nil && stf != nil && !stf.Success
+				st := report.Inconclusive
+				if rejectedF { st = report.Pass }
+				r.Add(report.Finding{
+					Name: "Future timestamp policy",
+					Category: "Event timestamp policy",
+					Severity: report.Low,
+					Status: st,
+					Evidence: map[string]any{"relay": url, "created_at": future.CreatedAt, "status": stf, "error": errString(errf)},
+					Mitigations: []string{"Reject events too far in the future or clamp timestamps"},
+					Timestamp: time.Now().UTC(),
+					Active: true,
+				})
+			}
+
+			// 6) Invalid tag format (malformed tag entry)
+			badTags := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe bad tag"}
+			badTags.Tags = append(badTags.Tags, []string{"malformed"}) // single-element tag
+			if err := badTags.Sign(sk); err == nil {
+				stbtag, errbtag := client.PublishWithAck(ctx, url, &badTags)
+				// Many relays may accept unknown tag shapes; treat rejection as PASS, acceptance as INCONCLUSIVE
+				rejectedT := errbtag == nil && stbtag != nil && !stbtag.Success
+				st := report.Inconclusive
+				if rejectedT { st = report.Pass }
+				r.Add(report.Finding{
+					Name: "Malformed tag handling",
+					Category: "Input validation",
+					Severity: report.Low,
+					Status: st,
+					Evidence: map[string]any{"relay": url, "status": stbtag, "error": errString(errbtag)},
+					Mitigations: []string{"Validate tag structure per NIP-01 or server policy"},
+					Timestamp: time.Now().UTC(),
+					Active: true,
+				})
 			}
 		}
 	}

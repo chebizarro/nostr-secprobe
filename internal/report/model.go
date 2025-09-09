@@ -25,6 +25,7 @@ type Finding struct {
 	Evidence  interface{} `json:"evidence,omitempty"`
 	Mitigations []string  `json:"mitigations,omitempty"`
 	Timestamp time.Time   `json:"timestamp"`
+	Active    bool        `json:"active,omitempty"`
 }
 
 type Results struct {

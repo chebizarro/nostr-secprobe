@@ -18,6 +18,11 @@ body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica
 .pass{background:#e6ffed;color:#006644}
 .fail{background:#ffebe6;color:#bf2600}
 .inc{background:#e6f7ff;color:#0747a6}
+.sev-low{background:#eef6ff;color:#0747a6}
+.sev-med{background:#fff7e6;color:#a36e00}
+.sev-high{background:#ffe6e6;color:#bf2600}
+.sev-crit{background:#000;color:#fff}
+.active{background:#f0f5ff;color:#2f54eb}
 .section{margin-top:16px;padding-top:8px;border-top:1px solid #f0f0f0}
 </style>`)
 	b.WriteString("</head><body>")
@@ -54,8 +59,20 @@ body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica
 			cl := "inc"
 			if f.Status == Pass { cl = "pass" } else if f.Status == Fail { cl = "fail" }
 			b.WriteString("<div class=card>")
-			b.WriteString(fmt.Sprintf("<div class=h>%s <span class=\"badge %s\">%s</span></div>", html.EscapeString(f.Name), cl, f.Status))
-			b.WriteString(fmt.Sprintf("<div>Category: %s | Severity: %s</div>", html.EscapeString(f.Category), f.Severity))
+			// Title with status badge, severity badge, and Active badge if applicable
+			sevCl := "sev-low"
+			switch f.Severity {
+			case Medium: sevCl = "sev-med"
+			case High: sevCl = "sev-high"
+			case Critical: sevCl = "sev-crit"
+			}
+			b.WriteString("<div class=h>")
+			b.WriteString(html.EscapeString(f.Name))
+			b.WriteString(fmt.Sprintf(" <span class=\"badge %s\">%s</span>", cl, f.Status))
+			b.WriteString(fmt.Sprintf(" <span class=\"badge %s\">%s</span>", sevCl, f.Severity))
+			if f.Active { b.WriteString(" <span class=\"badge active\">ACTIVE</span>") }
+			b.WriteString("</div>")
+			b.WriteString(fmt.Sprintf("<div>Category: %s</div>", html.EscapeString(f.Category)))
 			if f.Evidence != nil {
 				b.WriteString("<pre style=\"white-space:pre-wrap\">")
 				b.WriteString(html.EscapeString(asJSON(f.Evidence)))

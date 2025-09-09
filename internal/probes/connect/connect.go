@@ -57,6 +57,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 		Evidence: evidence,
 		Mitigations: []string{"Use HKDF with distinct info labels (e.g., 'NIP04' vs 'NIP46')"},
 		Timestamp: time.Now().UTC(),
+		Active: opt.Active && opt.IUnderstand,
 	})
 	return r, nil
 }
