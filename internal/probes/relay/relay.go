@@ -83,6 +83,49 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 		}
 	}
 
+	// Duplicate event rejection: attempt to re-publish the same event ID/signature.
+	if !opt.DryRun {
+		for _, url := range opt.Targets {
+			st2, err2 := client.PublishWithAck(ctx, url, &ev)
+			// Expect rejection; if accepted again, that's suspicious.
+			rejected := err2 == nil && st2 != nil && !st2.Success
+			r.Add(report.Finding{
+				Name: "Reject duplicate event (id replay)",
+				Category: "Replay & duplication control",
+				Severity: report.Low,
+				Status: choose(rejected, report.Pass, report.Fail),
+				Evidence: map[string]any{"event_id": ev.ID, "relay": url, "status": st2, "error": errString(err2)},
+				Mitigations: []string{"Track seen event IDs and reject duplicates"},
+				Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+
+	// Simple rate/burst behavior probe (informational unless we can detect clear limit signals).
+	if opt.Active && !opt.DryRun {
+		burstN := opt.MaxEvents
+		if burstN <= 0 || burstN > 20 { burstN = 20 }
+		for _, url := range opt.Targets {
+			sent := 0
+			fails := 0
+			for i := 0; i < burstN; i++ {
+				e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
+				if err := e.Sign(sk); err != nil { fails++; continue }
+				st, err := client.PublishWithAck(ctx, url, &e)
+				if err != nil || st == nil || !st.Success { fails++ } else { sent++ }
+			}
+			r.Add(report.Finding{
+				Name: "Rate limiting / burst behavior (informational)",
+				Category: "Rate limiting",
+				Severity: report.Low,
+				Status: report.Inconclusive,
+				Evidence: map[string]any{"relay": url, "attempted": burstN, "sent": sent, "failures": fails},
+				Mitigations: []string{"Enforce per-pubkey/per-IP rate limiting and provide clear backpressure responses"},
+				Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+
 	return r, nil
 }
 
