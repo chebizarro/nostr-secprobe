@@ -1,0 +1,21 @@
+# Binaries
+/nostr-secprobe
+/bin/
+/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+coverage.out
+*.pdf
+*.html
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
