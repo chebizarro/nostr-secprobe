@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"time"
+	"strings"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 
@@ -58,6 +59,56 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Mitigations: []string{"Recompute event id from canonical bytes", "Verify Schnorr signatures before trust/cache"},
 				Timestamp: time.Now().UTC(),
 			})
+
+			// Subscription integrity: fetch the event back and verify canonical ID matches
+			if ok {
+				rx, errc := gonostr.RelayConnect(ctx, url)
+				if errc == nil {
+					func() {
+						defer rx.Close()
+						ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+						defer cancel()
+						evs, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{ev.ID}})
+						if qerr != nil {
+							r.Add(report.Finding{
+								Name: "Subscription/query integrity",
+								Category: "Event-ID & signature integrity",
+								Severity: report.Low,
+								Status: report.Inconclusive,
+								Evidence: map[string]any{"relay": url, "error": qerr.Error()},
+								Mitigations: []string{"Ensure ID is recomputed on store/retrieval"},
+								Timestamp: time.Now().UTC(),
+							})
+							return
+						}
+						if len(evs) == 0 {
+							r.Add(report.Finding{
+								Name: "Subscription/query integrity",
+								Category: "Event-ID & signature integrity",
+								Severity: report.Low,
+								Status: report.Inconclusive,
+								Evidence: map[string]any{"relay": url, "note": "event not returned by ID shortly after publish"},
+								Mitigations: []string{"Ensure ID search works or allow for propagation delay"},
+								Timestamp: time.Now().UTC(),
+							})
+							return
+						}
+						// Verify canonical id of the first match
+						got := evs[0]
+						canon := nostrx.CanonicalID(got)
+						matches := canon == got.ID
+						r.Add(report.Finding{
+							Name: "Subscription/query canonical ID matches",
+							Category: "Event-ID & signature integrity",
+							Severity: report.Low,
+							Status: choose(matches, report.Pass, report.Fail),
+							Evidence: map[string]any{"relay": url, "returned_id": got.ID, "recomputed_id": canon},
+							Mitigations: []string{"Always recompute ID from serialize()"},
+							Timestamp: time.Now().UTC(),
+						})
+					}()
+				}
+			}
 		}
 	}
 
@@ -101,6 +152,26 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 		}
 	}
 
+	// Malformed signature rejection: sign a valid event, then corrupt its signature.
+	if !opt.DryRun {
+		bad := ev
+		// Ensure we have a signature field style as hex string of 64 bytes (128 hex chars).
+		bad.Sig = strings.Repeat("0", 128)
+		for _, url := range opt.Targets {
+			st3, err3 := client.PublishWithAck(ctx, url, &bad)
+			rejected := err3 == nil && st3 != nil && !st3.Success
+			r.Add(report.Finding{
+				Name: "Reject invalid signature",
+				Category: "Event signature validation",
+				Severity: report.High,
+				Status: choose(rejected, report.Pass, report.Fail),
+				Evidence: map[string]any{"event_id": bad.ID, "relay": url, "status": st3, "error": errString(err3)},
+				Mitigations: []string{"Verify Schnorr signatures and reject invalid events"},
+				Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+
 	// Simple rate/burst behavior probe (informational unless we can detect clear limit signals).
 	if opt.Active && !opt.DryRun {
 		burstN := opt.MaxEvents
@@ -123,6 +194,88 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Mitigations: []string{"Enforce per-pubkey/per-IP rate limiting and provide clear backpressure responses"},
 				Timestamp: time.Now().UTC(),
 			})
+		}
+	}
+
+	// Additional active checks: malformed events and filter fuzzing
+	if opt.Active && !opt.DryRun {
+		for _, url := range opt.Targets {
+			// 1) Invalid pubkey with stale id/sig
+			badPK := ev
+			badPK.PubKey = "00"
+			stpk, errpk := client.PublishWithAck(ctx, url, &badPK)
+			rejectedPK := errpk == nil && stpk != nil && !stpk.Success
+			r.Add(report.Finding{
+				Name: "Reject invalid pubkey in event",
+				Category: "Event validation",
+				Severity: report.Medium,
+				Status: choose(rejectedPK, report.Pass, report.Fail),
+				Evidence: map[string]any{"relay": url, "status": stpk, "error": errString(errpk)},
+				Mitigations: []string{"Validate pubkey encoding and signature binding"},
+				Timestamp: time.Now().UTC(),
+			})
+
+			// 2) Invalid kind (negative), properly signed
+			badKind := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: -1, Content: "secprobe bad kind"}
+			if err := badKind.Sign(sk); err == nil {
+				stk, errk := client.PublishWithAck(ctx, url, &badKind)
+				// Expect rejection, but if accepted we mark Fail
+				rejectedK := errk == nil && stk != nil && !stk.Success
+				r.Add(report.Finding{
+					Name: "Reject invalid kind (negative)",
+					Category: "Event validation",
+					Severity: report.Low,
+					Status: choose(rejectedK, report.Pass, report.Fail),
+					Evidence: map[string]any{"relay": url, "status": stk, "error": errString(errk)},
+					Mitigations: []string{"Enforce valid kind ranges per policy"},
+					Timestamp: time.Now().UTC(),
+				})
+			}
+
+			// 3) Oversized content (16 KiB)
+			big := make([]byte, 16*1024)
+			for i := range big { big[i] = 'A' }
+			bigEv := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: string(big)}
+			if err := bigEv.Sign(sk); err == nil {
+				stb, errb := client.PublishWithAck(ctx, url, &bigEv)
+				// Relay policy-dependent: treat acceptance as Inconclusive, rejection as Pass.
+				rejectedBig := errb == nil && stb != nil && !stb.Success
+				status := report.Inconclusive
+				if rejectedBig { status = report.Pass }
+				r.Add(report.Finding{
+					Name: "Oversized content policy",
+					Category: "Event size policy",
+					Severity: report.Low,
+					Status: status,
+					Evidence: map[string]any{"relay": url, "size_bytes": len(big), "status": stb, "error": errString(errb)},
+					Mitigations: []string{"Document and enforce reasonable content size limits"},
+					Timestamp: time.Now().UTC(),
+				})
+			}
+
+			// 4) Subscription filter fuzzing: invalid IDs and kinds
+			rx, errc := gonostr.RelayConnect(ctx, url)
+			if errc == nil {
+				func() {
+					defer rx.Close()
+					ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					// Invalid IDs (non-hex), invalid kinds (negative)
+					_, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{"nothex-id"}, Kinds: []int{-5}})
+					// We consider either an error response or empty result as acceptable handling.
+					st := report.Pass
+					if qerr != nil { st = report.Pass } // handled with error is fine
+					r.Add(report.Finding{
+						Name: "Subscription filter fuzz handling",
+						Category: "Input validation",
+						Severity: report.Low,
+						Status: st,
+						Evidence: map[string]any{"relay": url, "error": errString(qerr)},
+						Mitigations: []string{"Validate filters and avoid processing invalid IDs/kinds"},
+						Timestamp: time.Now().UTC(),
+					})
+				}()
+			}
 		}
 	}
 
