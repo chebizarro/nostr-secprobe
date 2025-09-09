@@ -1,0 +1,359 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required for creating GitHub Releases
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            archive: zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Print Go env
+        run: go env
+
+      - name: Build binary (GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }})
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          BIN_NAME=nostr-secprobe
+          OUT_DIR=dist/${{ matrix.goos }}_${{ matrix.goarch }}
+          mkdir -p "$OUT_DIR"
+          VERSION="${GITHUB_REF_NAME}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          go build -trimpath -ldflags "$LDFLAGS" -o "$OUT_DIR/${BIN_NAME}${{ matrix.ext }}" ./cmd/nostr-secprobe
+          # Include docs into the package directory for archiving
+          cp -f README.md "$OUT_DIR/" || true
+          cp -f LICENSE "$OUT_DIR/" || true
+
+      - name: Archive artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_NAME=nostr-secprobe
+          OUT_DIR=dist/${{ matrix.goos }}_${{ matrix.goarch }}
+          VERSION="${GITHUB_REF_NAME}"
+          PKG_NAME="${BIN_NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          cd "$OUT_DIR"
+          if [ '${{ matrix.archive }}' = 'zip' ]; then
+            zip -9 "${PKG_NAME}.zip" "${BIN_NAME}${{ matrix.ext }}" README.md LICENSE || true
+            ASSET_PATH="$(realpath "${PKG_NAME}.zip")"
+          else
+            tar -czf "${PKG_NAME}.tar.gz" "${BIN_NAME}${{ matrix.ext }}" README.md LICENSE || true
+            ASSET_PATH="$(realpath "${PKG_NAME}.tar.gz")"
+          fi
+          echo "ASSET_PATH=$ASSET_PATH" >> $GITHUB_ENV
+          # Generate SHA256 checksum file next to archive
+          sha256sum "$(basename "$ASSET_PATH")" > "${PKG_NAME}.sha256"
+          echo "CHECKSUM_PATH=$(realpath \"${PKG_NAME}.sha256\")" >> $GITHUB_ENV
+
+      - name: Verify checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_NAME=nostr-secprobe
+          OUT_DIR=dist/${{ matrix.goos }}_${{ matrix.goarch }}
+          VERSION="${GITHUB_REF_NAME}"
+          PKG_NAME="${BIN_NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          cd "$OUT_DIR"
+          sha256sum -c "${PKG_NAME}.sha256"
+
+      - name: Upload artifact to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ${{ env.ASSET_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ASSET_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          draft: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  verify-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: tar.gz
+          - os: linux
+            arch: arm64
+            ext: tar.gz
+          - os: darwin
+            arch: amd64
+            ext: tar.gz
+          - os: darwin
+            arch: arm64
+            ext: tar.gz
+          - os: windows
+            arch: amd64
+            ext: zip
+          - os: windows
+            arch: arm64
+            ext: zip
+    steps:
+      - name: Download checksum artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: checks
+
+      - name: Verify re-downloaded release asset checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO='${{ github.repository }}'
+          TAG='${{ github.ref_name }}'
+          BIN=nostr-secprobe
+          FILE="${BIN}_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.${{ matrix.ext }}"
+          URL="https://github.com/${REPO}/releases/download/${TAG}/${FILE}"
+          mkdir -p dl
+          echo "Downloading ${URL}"
+          curl -sSLf -o "dl/${FILE}" "${URL}"
+          echo "Downloaded. Computing SHA256..."
+          pushd dl >/dev/null
+          sha256sum "${FILE}" > "/tmp/${FILE}.sha256.actual"
+          popd >/dev/null
+          echo "Comparing against produced checksum..."
+          # The produced checksum file was uploaded as an artifact; match on filename
+          EXPECTED_FILE="checks/${BIN}_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.sha256"
+          if ! test -f "${EXPECTED_FILE}"; then
+            echo "Expected checksum file not found: ${EXPECTED_FILE}" >&2
+            exit 1
+          fi
+          ACTUAL_HASH=$(cut -d ' ' -f1 "/tmp/${FILE}.sha256.actual")
+          EXPECTED_HASH=$(cut -d ' ' -f1 "${EXPECTED_FILE}")
+          echo "EXPECTED: ${EXPECTED_HASH}"
+          echo "ACTUAL  : ${ACTUAL_HASH}"
+          test "${ACTUAL_HASH}" = "${EXPECTED_HASH}"
+
+  publish-scoop:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check bucket secrets
+        id: check
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.SCOOP_BUCKET }}" ] || [ -z "${{ secrets.SCOOP_TOKEN }}" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout bucket repo
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SCOOP_BUCKET }}
+          token: ${{ secrets.SCOOP_TOKEN }}
+          path: bucketrepo
+
+      - name: Download windows amd64 artifact
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-windows-amd64
+          path: downloads/windows_amd64
+
+      - name: Download windows arm64 artifact
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-windows-arm64
+          path: downloads/windows_arm64
+
+      - name: Generate Scoop manifest
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO='${{ github.repository }}'
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
+          TAG='${{ github.ref_name }}'
+          BIN=nostr-secprobe
+          FILE_AMD64="${BIN}_${TAG}_windows_amd64.zip"
+          FILE_ARM64="${BIN}_${TAG}_windows_arm64.zip"
+          URL_AMD64="https://github.com/${OWNER}/${NAME}/releases/download/${TAG}/${FILE_AMD64}"
+          URL_ARM64="https://github.com/${OWNER}/${NAME}/releases/download/${TAG}/${FILE_ARM64}"
+          SHA_AMD64=$(cut -d ' ' -f1 downloads/windows_amd64/${BIN}_${TAG}_windows_amd64.sha256)
+          SHA_ARM64=$(cut -d ' ' -f1 downloads/windows_arm64/${BIN}_${TAG}_windows_arm64.sha256)
+          mkdir -p bucketrepo/bucket
+          MANIFEST=bucketrepo/bucket/nostr-secprobe.json
+          printf '{\n' > "$MANIFEST"
+          printf '  "version": "%s",\n' "$TAG" >> "$MANIFEST"
+          printf '  "description": "Probe Nostr relays and clients for known vulnerabilities",\n' >> "$MANIFEST"
+          printf '  "homepage": "https://github.com/%s/%s",\n' "$OWNER" "$NAME" >> "$MANIFEST"
+          printf '  "license": "MIT",\n' >> "$MANIFEST"
+          printf '  "architecture": {\n' >> "$MANIFEST"
+          printf '    "64bit": {"url": "%s", "hash": "%s"},\n' "$URL_AMD64" "$SHA_AMD64" >> "$MANIFEST"
+          printf '    "arm64": {"url": "%s", "hash": "%s"}\n' "$URL_ARM64" "$SHA_ARM64" >> "$MANIFEST"
+          printf '  },\n' >> "$MANIFEST"
+          printf '  "bin": "nostr-secprobe.exe",\n' >> "$MANIFEST"
+          printf '  "checkver": "github",\n' >> "$MANIFEST"
+          printf '  "autoupdate": {\n' >> "$MANIFEST"
+          printf '    "architecture": {\n' >> "$MANIFEST"
+          printf '      "64bit": {"url": "https://github.com/%s/%s/releases/download/$version/%s_$version_windows_amd64.zip"},\n' "$OWNER" "$NAME" "$BIN" >> "$MANIFEST"
+          printf '      "arm64": {"url": "https://github.com/%s/%s/releases/download/$version/%s_$version_windows_arm64.zip"}\n' "$OWNER" "$NAME" "$BIN" >> "$MANIFEST"
+          printf '    }\n' >> "$MANIFEST"
+          printf '  }\n' >> "$MANIFEST"
+          printf '}\n' >> "$MANIFEST"
+
+      - name: Commit and push manifest
+        if: steps.check.outputs.skip == 'false'
+        working-directory: bucketrepo
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add bucket/nostr-secprobe.json
+          git commit -m "Update nostr-secprobe scoop manifest for ${{ github.ref_name }}" || echo "No changes"
+          git push
+
+  publish-homebrew:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets
+        id: check
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAP_REPO }}" ] || [ -z "${{ secrets.TAP_TOKEN }}" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout tap repo
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.TAP_REPO }}
+          token: ${{ secrets.TAP_TOKEN }}
+          path: taprepo
+
+      - name: Download darwin amd64 artifacts
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-darwin-amd64
+          path: downloads/darwin_amd64
+
+      - name: Download darwin arm64 artifacts
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-darwin-arm64
+          path: downloads/darwin_arm64
+
+      - name: Generate Homebrew formula
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_FULL='${{ github.repository }}'
+          OWNER="${REPO_FULL%%/*}"
+          NAME="${REPO_FULL##*/}"
+          TAG='${{ github.ref_name }}'
+          BIN=nostr-secprobe
+          AMD64_FILE="${BIN}_${TAG}_darwin_amd64.tar.gz"
+          ARM64_FILE="${BIN}_${TAG}_darwin_arm64.tar.gz"
+          AMD64_SHA=$(cut -d ' ' -f1 downloads/darwin_amd64/${BIN}_${TAG}_darwin_amd64.sha256)
+          ARM64_SHA=$(cut -d ' ' -f1 downloads/darwin_arm64/${BIN}_${TAG}_darwin_arm64.sha256)
+          URL_AMD64="https://github.com/${OWNER}/${NAME}/releases/download/${TAG}/${AMD64_FILE}"
+          URL_ARM64="https://github.com/${OWNER}/${NAME}/releases/download/${TAG}/${ARM64_FILE}"
+          mkdir -p taprepo/Formula
+          FORMULA_PATH=taprepo/Formula/nostr-secprobe.rb
+          printf '%s\n' \
+"class NostrSecprobe < Formula" \
+"  desc \"Probe Nostr relays and clients for known vulnerabilities\"" \
+"  homepage \"https://github.com/${OWNER}/${NAME}\"" \
+"  version \"${TAG}\"" \
+"" \
+"  on_macos do" \
+"    if Hardware::CPU.intel?" \
+"      url \"${URL_AMD64}\"" \
+"      sha256 \"${AMD64_SHA}\"" \
+"    end" \
+"    if Hardware::CPU.arm?" \
+"      url \"${URL_ARM64}\"" \
+"      sha256 \"${ARM64_SHA}\"" \
+"    end" \
+"  end" \
+"" \
+"  def install" \
+"    bin.install \"nostr-secprobe\"" \
+"  end" \
+"" \
+"  test do" \
+"    system \"#{bin}/nostr-secprobe\", \"--version\"" \
+"  end" \
+"end" \
+> "$FORMULA_PATH"
+
+      - name: Commit and push formula
+        if: steps.check.outputs.skip == 'false'
+        working-directory: taprepo
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add Formula/nostr-secprobe.rb
+          git commit -m "Update nostr-secprobe formula for ${{ github.ref_name }}" || echo "No changes"
+          git push

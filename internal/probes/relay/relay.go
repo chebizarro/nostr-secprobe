@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 	"strings"
+	"sort"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 
@@ -182,13 +183,28 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			sent := 0
 			fails := 0
 			var durs []time.Duration
+			var qdurs []time.Duration
+			// Create a query connection if available for timing queries
+			rx, rxErr := gonostr.RelayConnect(ctx, url)
+			if rxErr == nil { defer rx.Close() }
 			for i := 0; i < burstN; i++ {
 				e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
 				if err := e.Sign(sk); err != nil { fails++; continue }
 				t0 := time.Now()
 				st, err := client.PublishWithAck(ctx, url, &e)
 				durs = append(durs, time.Since(t0))
-				if err != nil || st == nil || !st.Success { fails++ } else { sent++ }
+				if err != nil || st == nil || !st.Success { fails++ } else {
+					sent++
+					// Time a query-by-ID round-trip when we have a connection
+					if rxErr == nil {
+						ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+						qt0 := time.Now()
+						_, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
+						cancel()
+						_ = qerr // treat any response time equally for now
+						qdurs = append(qdurs, time.Since(qt0))
+					}
+				}
 			}
 			// compute simple stats in milliseconds
 			ms := func(d time.Duration) float64 { return float64(d.Milliseconds()) }
@@ -202,6 +218,52 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			}
 			avg := time.Duration(0)
 			if len(durs) > 0 { avg = time.Duration(int64(sum) / int64(len(durs))) }
+			// percentiles
+			var p50, p90, p99 float64
+			if len(durs) > 0 {
+				cds := make([]time.Duration, len(durs))
+				copy(cds, durs)
+				sort.Slice(cds, func(i, j int) bool { return cds[i] < cds[j] })
+				idx := func(p float64) int {
+					n := len(cds)
+					if n == 0 { return 0 }
+					k := int(p*float64(n-1) + 0.5)
+					if k < 0 { k = 0 }
+					if k >= n { k = n-1 }
+					return k
+				}
+				p50 = ms(cds[idx(0.50)])
+				p90 = ms(cds[idx(0.90)])
+				p99 = ms(cds[idx(0.99)])
+			}
+			// query percentiles
+			var qp50, qp90, qp99, qmin, qavg, qmax float64
+			if len(qdurs) > 0 {
+				qminD, qmaxD := qdurs[0], qdurs[0]
+				var qsum time.Duration
+				cds := make([]time.Duration, len(qdurs))
+				copy(cds, qdurs)
+				sort.Slice(cds, func(i, j int) bool { return cds[i] < cds[j] })
+				idx := func(p float64) int {
+					n := len(cds)
+					if n == 0 { return 0 }
+					k := int(p*float64(n-1) + 0.5)
+					if k < 0 { k = 0 }
+					if k >= n { k = n-1 }
+					return k
+				}
+				for _, d := range qdurs {
+					if d < qminD { qminD = d }
+					if d > qmaxD { qmaxD = d }
+					qsum += d
+				}
+				qp50 = ms(cds[idx(0.50)])
+				qp90 = ms(cds[idx(0.90)])
+				qp99 = ms(cds[idx(0.99)])
+				qmin = ms(qminD)
+				qmax = ms(qmaxD)
+				qavg = ms(time.Duration(int64(qsum) / int64(len(qdurs))))
+			}
 			r.Add(report.Finding{
 				Name: "Rate limiting / burst behavior (informational)",
 				Category: "Rate limiting",
@@ -215,6 +277,15 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					"latency_ms_min": ms(min),
 					"latency_ms_avg": ms(avg),
 					"latency_ms_max": ms(max),
+					"latency_ms_p50": p50,
+					"latency_ms_p90": p90,
+					"latency_ms_p99": p99,
+					"query_latency_ms_min": qmin,
+					"query_latency_ms_avg": qavg,
+					"query_latency_ms_max": qmax,
+					"query_latency_ms_p50": qp50,
+					"query_latency_ms_p90": qp90,
+					"query_latency_ms_p99": qp99,
 				},
 				Mitigations: []string{"Enforce per-pubkey/per-IP rate limiting and provide clear backpressure responses"},
 				Timestamp: time.Now().UTC(),
@@ -343,6 +414,97 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					Status: st,
 					Evidence: map[string]any{"relay": url, "status": stbtag, "error": errString(errbtag)},
 					Mitigations: []string{"Validate tag structure per NIP-01 or server policy"},
+					Timestamp: time.Now().UTC(),
+					Active: true,
+				})
+			}
+
+			// 7) Non-hex pubkey
+			badPKNonHex := ev
+			badPKNonHex.PubKey = "zzzz"
+			stpknh, errpknh := client.PublishWithAck(ctx, url, &badPKNonHex)
+			rejectedPKNH := errpknh == nil && stpknh != nil && !stpknh.Success
+			r.Add(report.Finding{
+				Name: "Reject non-hex pubkey",
+				Category: "Event validation",
+				Severity: report.Medium,
+				Status: choose(rejectedPKNH, report.Pass, report.Fail),
+				Evidence: map[string]any{"relay": url, "status": stpknh, "error": errString(errpknh)},
+				Mitigations: []string{"Validate pubkey encoding strictly as hex"},
+				Timestamp: time.Now().UTC(),
+				Active: true,
+			})
+
+			// 8) Short hex pubkey (too short)
+			badPKShort := ev
+			badPKShort.PubKey = "deadbeef"
+			stpks, errpks := client.PublishWithAck(ctx, url, &badPKShort)
+			rejectedPKS := errpks == nil && stpks != nil && !stpks.Success
+			r.Add(report.Finding{
+				Name: "Reject short hex pubkey",
+				Category: "Event validation",
+				Severity: report.Medium,
+				Status: choose(rejectedPKS, report.Pass, report.Fail),
+				Evidence: map[string]any{"relay": url, "status": stpks, "error": errString(errpks)},
+				Mitigations: []string{"Validate pubkey length and structure"},
+				Timestamp: time.Now().UTC(),
+				Active: true,
+			})
+
+			// 9) Past timestamp skew policy (-48h)
+			past := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Timestamp(time.Now().Add(-48 * time.Hour).Unix()), Kind: gonostr.KindTextNote, Content: "secprobe past timestamp"}
+			if err := past.Sign(sk); err == nil {
+				stp, errp := client.PublishWithAck(ctx, url, &past)
+				// Policy-dependent; treat acceptance as INCONCLUSIVE, rejection as PASS
+				rejectedP := errp == nil && stp != nil && !stp.Success
+				st := report.Inconclusive
+				if rejectedP { st = report.Pass }
+				r.Add(report.Finding{
+					Name: "Past timestamp policy",
+					Category: "Event timestamp policy",
+					Severity: report.Low,
+					Status: st,
+					Evidence: map[string]any{"relay": url, "created_at": past.CreatedAt, "status": stp, "error": errString(errp)},
+					Mitigations: []string{"Clamp or accept within allowed skew; reject too old events if policy requires"},
+					Timestamp: time.Now().UTC(),
+					Active: true,
+				})
+			}
+
+			// 10) Empty tag and too-long tag
+			emptyTag := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe empty tag"}
+			emptyTag.Tags = append(emptyTag.Tags, []string{})
+			if err := emptyTag.Sign(sk); err == nil {
+				ste, erre := client.PublishWithAck(ctx, url, &emptyTag)
+				rejectedE := erre == nil && ste != nil && !ste.Success
+				st := report.Inconclusive
+				if rejectedE { st = report.Pass }
+				r.Add(report.Finding{
+					Name: "Empty tag handling",
+					Category: "Input validation",
+					Severity: report.Low,
+					Status: st,
+					Evidence: map[string]any{"relay": url, "status": ste, "error": errString(erre)},
+					Mitigations: []string{"Reject empty tag entries or normalize per policy"},
+					Timestamp: time.Now().UTC(),
+					Active: true,
+				})
+			}
+			tooLongTag := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe long tag"}
+			tooLongTag.Tags = append(tooLongTag.Tags, []string{"x","1","2","3","4","5","6","7","8","9","10"})
+			if err := tooLongTag.Sign(sk); err == nil {
+				stl, errl := client.PublishWithAck(ctx, url, &tooLongTag)
+				// Policy varies; treat rejection as PASS
+				rejectedL := errl == nil && stl != nil && !stl.Success
+				st := report.Inconclusive
+				if rejectedL { st = report.Pass }
+				r.Add(report.Finding{
+					Name: "Too-long tag handling",
+					Category: "Input validation",
+					Severity: report.Low,
+					Status: st,
+					Evidence: map[string]any{"relay": url, "status": stl, "error": errString(errl)},
+					Mitigations: []string{"Enforce reasonable tag element length and count"},
 					Timestamp: time.Now().UTC(),
 					Active: true,
 				})

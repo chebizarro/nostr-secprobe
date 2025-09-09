@@ -18,6 +18,9 @@ import (
 	"nostr-secprobe/pkg/logx"
 )
 
+// version is populated at build time via -ldflags -X main.version=$TAG
+var version = "dev"
+
 var (
 	flagTargets     string
 	flagOut         string
@@ -41,6 +44,7 @@ func main() {
 		Use:   "nostr-secprobe",
 		Short: "Probe Nostr relays and clients for known vulns",
 	}
+	root.Version = version
 
 	root.PersistentFlags().StringVar(&flagTargets, "targets", env("NSEC_TARGETS", ""), "CSV of relay URLs or client targets")
 	root.PersistentFlags().StringVar(&flagOut, "out", env("NSEC_OUT", "report.json"), "JSON report output path")
