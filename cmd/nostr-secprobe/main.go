@@ -47,6 +47,9 @@ func main() {
 	root := &cobra.Command{
 		Use:   "nostr-secprobe",
 		Short: "Probe Nostr relays and clients for known vulns",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return loadConfigIfAny(cmd)
+		},
 	}
 	root.Version = version
 
@@ -76,11 +79,6 @@ func main() {
 	root.AddCommand(cmdServePreview())
 	root.AddCommand(cmdReport())
 
-	if err := loadConfigIfAny(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
 	if err := root.Execute(); err != nil {
 		if ee, ok := err.(exitError); ok {
 			fmt.Fprintln(os.Stderr, ee.err)
@@ -93,27 +91,27 @@ func main() {
 
 // Config captures CLI-equivalent options for loading via --config JSON.
 type Config struct {
-	Targets      string        `json:"targets"`
-	Out          string        `json:"out"`
-	HTML         string        `json:"html"`
-	PDF          string        `json:"pdf"`
-	PreviewHost  string        `json:"preview_host"`
-	Active       bool          `json:"active"`
-	IUnderstand  bool          `json:"i_understand"`
-	Rate         int           `json:"rate"`
-	MaxEvents    int           `json:"max_events"`
-	Timeout      time.Duration `json:"timeout"`
-	PubKey       string        `json:"pubkey"`
-	SecKey       string        `json:"seckey"`
-	NoStore      bool          `json:"no_store"`
-	LogLevel     string        `json:"log_level"`
-	DryRun       bool          `json:"dry_run"`
-	Concurrency  int           `json:"concurrency"`
-	Backoff      time.Duration `json:"backoff"`
-	Retries      int           `json:"retries"`
+	Targets      string `json:"targets"`
+	Out          string `json:"out"`
+	HTML         string `json:"html"`
+	PDF          string `json:"pdf"`
+	PreviewHost  string `json:"preview_host"`
+	Active       bool   `json:"active"`
+	IUnderstand  bool   `json:"i_understand"`
+	Rate         int    `json:"rate"`
+	MaxEvents    int    `json:"max_events"`
+	Timeout      string `json:"timeout"`
+	PubKey       string `json:"pubkey"`
+	SecKey       string `json:"seckey"`
+	NoStore      bool   `json:"no_store"`
+	LogLevel     string `json:"log_level"`
+	DryRun       bool   `json:"dry_run"`
+	Concurrency  int    `json:"concurrency"`
+	Backoff      string `json:"backoff"`
+	Retries      int    `json:"retries"`
 }
 
-func loadConfigIfAny() error {
+func loadConfigIfAny(cmd *cobra.Command) error {
 	if flagConfig == "" {
 		return nil
 	}
@@ -125,59 +123,63 @@ func loadConfigIfAny() error {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return err
 	}
-	// Apply only non-zero/non-empty values. Flags remain authoritative if provided.
-	if cfg.Targets != "" {
+	// Apply only if the flag wasn't explicitly set on CLI
+	if cfg.Targets != "" && !cmd.Flags().Changed("targets") {
 		flagTargets = cfg.Targets
 	}
-	if cfg.Out != "" {
+	if cfg.Out != "" && !cmd.Flags().Changed("out") {
 		flagOut = cfg.Out
 	}
-	if cfg.HTML != "" {
+	if cfg.HTML != "" && !cmd.Flags().Changed("html") {
 		flagHTML = cfg.HTML
 	}
-	if cfg.PDF != "" {
+	if cfg.PDF != "" && !cmd.Flags().Changed("pdf") {
 		flagPDF = cfg.PDF
 	}
-	if cfg.PreviewHost != "" {
+	if cfg.PreviewHost != "" && !cmd.Flags().Changed("preview-host") {
 		flagPreviewHost = cfg.PreviewHost
 	}
-	if cfg.Active {
+	if cfg.Active && !cmd.Flags().Changed("active") {
 		flagActive = true
 	}
-	if cfg.IUnderstand {
+	if cfg.IUnderstand && !cmd.Flags().Changed("i-understand") {
 		flagIUnderstand = true
 	}
-	if cfg.Rate > 0 {
+	if cfg.Rate > 0 && !cmd.Flags().Changed("rate") {
 		flagRate = cfg.Rate
 	}
-	if cfg.MaxEvents > 0 {
+	if cfg.MaxEvents > 0 && !cmd.Flags().Changed("max-events") {
 		flagMaxEvents = cfg.MaxEvents
 	}
-	if cfg.Timeout > 0 {
-		flagTimeout = cfg.Timeout
+	if cfg.Timeout != "" && !cmd.Flags().Changed("timeout") {
+		if d, err := time.ParseDuration(cfg.Timeout); err == nil {
+			flagTimeout = d
+		}
 	}
-	if cfg.PubKey != "" {
+	if cfg.PubKey != "" && !cmd.Flags().Changed("pubkey") {
 		flagPubKey = cfg.PubKey
 	}
-	if cfg.SecKey != "" {
+	if cfg.SecKey != "" && !cmd.Flags().Changed("seckey") {
 		flagSecKey = cfg.SecKey
 	}
-	if cfg.NoStore {
+	if cfg.NoStore && !cmd.Flags().Changed("no-store") {
 		flagNoStore = true
 	}
-	if cfg.LogLevel != "" {
+	if cfg.LogLevel != "" && !cmd.Flags().Changed("log-level") {
 		flagLogLevel = cfg.LogLevel
 	}
-	if cfg.DryRun {
+	if cfg.DryRun && !cmd.Flags().Changed("dry-run") {
 		flagDryRun = true
 	}
-	if cfg.Concurrency > 0 {
+	if cfg.Concurrency > 0 && !cmd.Flags().Changed("concurrency") {
 		flagConcurrency = cfg.Concurrency
 	}
-	if cfg.Backoff > 0 {
-		flagBackoff = cfg.Backoff
+	if cfg.Backoff != "" && !cmd.Flags().Changed("backoff") {
+		if d, err := time.ParseDuration(cfg.Backoff); err == nil {
+			flagBackoff = d
+		}
 	}
-	if cfg.Retries > 0 {
+	if cfg.Retries > 0 && !cmd.Flags().Changed("retries") {
 		flagRetries = cfg.Retries
 	}
 	return nil
@@ -331,8 +333,9 @@ func env(k, def string) string {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		var i int
-		fmt.Sscanf(v, "%d", &i)
-		return i
+		if _, err := fmt.Sscanf(v, "%d", &i); err == nil {
+			return i
+		}
 	}
 	return def
 }

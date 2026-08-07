@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sort"
 	"sync"
-	"math/rand"
+	"math/rand/v2"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 
@@ -192,59 +192,61 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			fails := 0
 			var durs []time.Duration
 			var qdurs []time.Duration
-			// Create a query connection if available for timing queries
-			rx, rxErr := gonostr.RelayConnect(ctx, url)
-			if rxErr == nil { defer rx.Close() }
-			// Concurrency control
-			conc := opt.Concurrency
-			if conc <= 0 { conc = 1 }
-			sem := make(chan struct{}, conc)
-			var wg sync.WaitGroup
-			var mu sync.Mutex
-			for i := 0; i < burstN; i++ {
-				sem <- struct{}{}
-				wg.Add(1)
-				go func() {
-					defer func() { <-sem; wg.Done() }()
-					// Build and sign event
-					e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
-					if err := e.Sign(sk); err != nil {
-						mu.Lock(); fails++; mu.Unlock();
-						return
-					}
-					// Publish with retries and backoff
-					var st *nostrx.Status
-					var perr error
-					var dur time.Duration
-					for attempt := 0; attempt <= opt.Retries; attempt++ {
+			// Wrap in a function to ensure defer runs after this iteration
+			func() {
+				// Create a query connection if available for timing queries
+				rx, rxErr := gonostr.RelayConnect(ctx, url)
+				if rxErr == nil { defer rx.Close() }
+				// Concurrency control
+				conc := opt.Concurrency
+				if conc <= 0 { conc = 1 }
+				sem := make(chan struct{}, conc)
+				var wg sync.WaitGroup
+				var mu sync.Mutex
+				for i := 0; i < burstN; i++ {
+					sem <- struct{}{}
+					wg.Add(1)
+					go func() {
+						defer func() { <-sem; wg.Done() }()
+						// Build and sign event
+						e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
+						if err := e.Sign(sk); err != nil {
+							mu.Lock(); fails++; mu.Unlock();
+							return
+						}
+						// Publish with retries and backoff
+						var st *nostrx.Status
+						var perr error
 						t0 := time.Now()
-						st, perr = client.PublishWithAck(ctx, url, &e)
-						dur = time.Since(t0)
-						if perr == nil && st != nil && st.Success {
-							break
+						for attempt := 0; attempt <= opt.Retries; attempt++ {
+							st, perr = client.PublishWithAck(ctx, url, &e)
+							if perr == nil && st != nil && st.Success {
+								break
+							}
+							if opt.Backoff > 0 && attempt < opt.Retries {
+								sleep := opt.Backoff << attempt
+								jitter := 0.8 + rand.Float64()*0.4
+								time.Sleep(time.Duration(float64(sleep) * jitter))
+							}
 						}
-						if opt.Backoff > 0 && attempt < opt.Retries {
-							sleep := opt.Backoff << attempt
-							jitter := 0.8 + rand.Float64()*0.4
-							time.Sleep(time.Duration(float64(sleep) * jitter))
+						dur := time.Since(t0)
+						if perr != nil || st == nil || !st.Success {
+							mu.Lock(); fails++; durs = append(durs, dur); mu.Unlock()
+							return
 						}
-					}
-					if perr != nil || st == nil || !st.Success {
-						mu.Lock(); fails++; durs = append(durs, dur); mu.Unlock()
-						return
-					}
-					// Success path
-					mu.Lock(); sent++; durs = append(durs, dur); mu.Unlock()
-					if rxErr == nil {
-						ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
-						qt0 := time.Now()
-						_, _ = rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
-						cancel()
-						mu.Lock(); qdurs = append(qdurs, time.Since(qt0)); mu.Unlock()
-					}
-				}()
-			}
-			wg.Wait()
+						// Success path
+						mu.Lock(); sent++; durs = append(durs, dur); mu.Unlock()
+						if rxErr == nil && rx != nil {
+							ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+							qt0 := time.Now()
+							_, _ = rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
+							cancel()
+							mu.Lock(); qdurs = append(qdurs, time.Since(qt0)); mu.Unlock()
+						}
+					}()
+				}
+				wg.Wait()
+			}()
 			// compute simple stats in milliseconds
 			ms := func(d time.Duration) float64 { return float64(d.Milliseconds()) }
 			var min, max time.Duration
