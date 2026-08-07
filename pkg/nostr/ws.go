@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 type RelayClient struct{}
@@ -14,8 +14,8 @@ type Status struct{
 	Message string
 }
 
-func (RelayClient) PublishWithAck(ctx context.Context, url string, ev *gonostr.Event) (*Status, error) {
-	r, err := gonostr.RelayConnect(ctx, url)
+func (RelayClient) PublishWithAck(ctx context.Context, url string, ev *nostr.Event) (*Status, error) {
+	r, err := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 	if err != nil { return nil, err }
 	defer r.Close()
 	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)

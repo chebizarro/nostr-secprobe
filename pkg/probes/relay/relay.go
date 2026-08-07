@@ -3,12 +3,11 @@ package relay
 import (
 	"context"
 	"time"
-	"strings"
 	"sort"
 	"sync"
 	"math/rand/v2"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"git.sharegap.net/cascadia/nostr-secprobe/pkg/logx"
 	nostrx "git.sharegap.net/cascadia/nostr-secprobe/pkg/nostr"
@@ -52,9 +51,15 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 
 	client := nostrx.RelayClient{}
 
+	// Convert hex strings to proper types
+	pkBytes, err := nostr.PubKeyFromHex(pk)
+	if err != nil { return nil, err }
+	skBytes, err := nostr.SecretKeyFromHex(sk)
+	if err != nil { return nil, err }
+
 	// Control event
-	ev := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe control"}
-	if err := ev.Sign(sk); err != nil { return nil, err }
+	ev := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: "secprobe control"}
+	if err := ev.Sign(skBytes); err != nil { return nil, err }
 	if !opt.DryRun {
 		for _, url := range opt.Targets {
 			st, err := client.PublishWithAck(ctx, url, &ev)
@@ -71,13 +76,21 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 
 			// Subscription integrity: fetch the event back and verify canonical ID matches
 			if ok {
-				rx, errc := gonostr.RelayConnect(ctx, url)
+				rx, errc := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 				if errc == nil {
 					func() {
 						defer rx.Close()
 						ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 						defer cancel()
-						evs, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{ev.ID}})
+						sub, qerr := rx.Subscribe(ctx2, nostr.Filter{IDs: []nostr.ID{ev.ID}}, nostr.SubscriptionOptions{})
+						var evs []*nostr.Event
+						if qerr == nil && sub != nil {
+							for evt := range sub.Events {
+								evs = append(evs, &evt)
+								if len(evs) >= 1 { break }
+							}
+							sub.Unsub()
+						}
 						if qerr != nil {
 							r.Add(report.Finding{
 								Name: "Subscription/query integrity",
@@ -105,7 +118,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 						// Verify canonical id of the first match
 						got := evs[0]
 						canon := nostrx.CanonicalID(got)
-						matches := canon == got.ID
+						matches := canon == got.ID.Hex()
 						r.Add(report.Finding{
 							Name: "Subscription/query canonical ID matches",
 							Category: "Event-ID & signature integrity",
@@ -165,8 +178,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 	// Malformed signature rejection: sign a valid event, then corrupt its signature.
 	if !opt.DryRun {
 		bad := ev
-		// Ensure we have a signature field style as hex string of 64 bytes (128 hex chars).
-		bad.Sig = strings.Repeat("0", 128)
+		// Corrupt the signature with all zeros
+		bad.Sig = [64]byte{}
 		for _, url := range opt.Targets {
 			st3, err3 := client.PublishWithAck(ctx, url, &bad)
 			rejected := err3 == nil && st3 != nil && !st3.Success
@@ -195,7 +208,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			// Wrap in a function to ensure defer runs after this iteration
 			func() {
 				// Create a query connection if available for timing queries
-				rx, rxErr := gonostr.RelayConnect(ctx, url)
+				rx, rxErr := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 				if rxErr == nil { defer rx.Close() }
 				// Concurrency control
 				conc := opt.Concurrency
@@ -209,8 +222,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					go func() {
 						defer func() { <-sem; wg.Done() }()
 						// Build and sign event
-						e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
-						if err := e.Sign(sk); err != nil {
+						e := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: "secprobe burst"}
+						if err := e.Sign(skBytes); err != nil {
 							mu.Lock(); fails++; mu.Unlock();
 							return
 						}
@@ -239,7 +252,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 						if rxErr == nil && rx != nil {
 							ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 							qt0 := time.Now()
-							_, _ = rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
+							sub, _ := rx.Subscribe(ctx2, nostr.Filter{IDs: []nostr.ID{e.ID}}, nostr.SubscriptionOptions{})
+							if sub != nil { sub.Unsub() }
 							cancel()
 							mu.Lock(); qdurs = append(qdurs, time.Since(qt0)); mu.Unlock()
 						}
@@ -340,7 +354,7 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 		for _, url := range opt.Targets {
 			// 1) Invalid pubkey with stale id/sig
 			badPK := ev
-			badPK.PubKey = "00"
+			badPK.PubKey = nostr.PubKey{} // all zeros - invalid
 			stpk, errpk := client.PublishWithAck(ctx, url, &badPK)
 			rejectedPK := errpk == nil && stpk != nil && !stpk.Success
 			r.Add(report.Finding{
@@ -354,9 +368,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Active: true,
 			})
 
-			// 2) Invalid kind (negative), properly signed
-			badKind := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: -1, Content: "secprobe bad kind"}
-			if err := badKind.Sign(sk); err == nil {
+			// 2) Invalid kind (unusual value), properly signed
+			badKind := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: 65535, Content: "secprobe bad kind"}
+			if err := badKind.Sign(skBytes); err == nil {
 				stk, errk := client.PublishWithAck(ctx, url, &badKind)
 				// Expect rejection, but if accepted we mark Fail
 				rejectedK := errk == nil && stk != nil && !stk.Success
@@ -375,8 +389,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			// 3) Oversized content (16 KiB)
 			big := make([]byte, 16*1024)
 			for i := range big { big[i] = 'A' }
-			bigEv := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: string(big)}
-			if err := bigEv.Sign(sk); err == nil {
+			bigEv := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: string(big)}
+			if err := bigEv.Sign(skBytes); err == nil {
 				stb, errb := client.PublishWithAck(ctx, url, &bigEv)
 				// Relay policy-dependent: treat acceptance as Inconclusive, rejection as Pass.
 				rejectedBig := errb == nil && stb != nil && !stb.Success
@@ -395,14 +409,16 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			}
 
 			// 4) Subscription filter fuzzing: invalid IDs and kinds
-			rx, errc := gonostr.RelayConnect(ctx, url)
+			rx, errc := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 			if errc == nil {
 				func() {
 					defer rx.Close()
 					ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 					defer cancel()
-					// Invalid IDs (non-hex), invalid kinds (negative)
-					_, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{"nothex-id"}, Kinds: []int{-5}})
+					// Invalid IDs (malformed) - this will likely fail during parsing
+					invalidID := nostr.ID{}
+					copy(invalidID[:], "nothex-id")
+					_, qerr := rx.Subscribe(ctx2, nostr.Filter{IDs: []nostr.ID{invalidID}, Kinds: []nostr.Kind{65535}}, nostr.SubscriptionOptions{})
 					// We consider either an error response or empty result as acceptable handling.
 					st := report.Pass
 					if qerr != nil { st = report.Pass } // handled with error is fine
@@ -420,8 +436,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			}
 
 			// 5) Future timestamp policy
-			future := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Timestamp(time.Now().Add(48 * time.Hour).Unix()), Kind: gonostr.KindTextNote, Content: "secprobe future timestamp"}
-			if err := future.Sign(sk); err == nil {
+			future := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Timestamp(time.Now().Add(48 * time.Hour).Unix()), Kind: nostr.KindTextNote, Content: "secprobe future timestamp"}
+			if err := future.Sign(skBytes); err == nil {
 				stf, errf := client.PublishWithAck(ctx, url, &future)
 				// Relay policy-dependent: if rejected, PASS; if accepted, INCONCLUSIVE
 				rejectedF := errf == nil && stf != nil && !stf.Success
@@ -440,9 +456,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			}
 
 			// 6) Invalid tag format (malformed tag entry)
-			badTags := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe bad tag"}
-			badTags.Tags = append(badTags.Tags, []string{"malformed"}) // single-element tag
-			if err := badTags.Sign(sk); err == nil {
+			badTags := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: "secprobe bad tag"}
+			badTags.Tags = append(badTags.Tags, nostr.Tag{"malformed"}) // single-element tag
+			if err := badTags.Sign(skBytes); err == nil {
 				stbtag, errbtag := client.PublishWithAck(ctx, url, &badTags)
 				// Many relays may accept unknown tag shapes; treat rejection as PASS, acceptance as INCONCLUSIVE
 				rejectedT := errbtag == nil && stbtag != nil && !stbtag.Success
@@ -460,9 +476,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				})
 			}
 
-			// 7) Non-hex pubkey
+			// 7) Non-hex pubkey (malformed)
 			badPKNonHex := ev
-			badPKNonHex.PubKey = "zzzz"
+			badPKNonHex.PubKey = nostr.PubKey{0xff, 0xff, 0xff, 0xff} // malformed pubkey
 			stpknh, errpknh := client.PublishWithAck(ctx, url, &badPKNonHex)
 			rejectedPKNH := errpknh == nil && stpknh != nil && !stpknh.Success
 			r.Add(report.Finding{
@@ -476,9 +492,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 				Active: true,
 			})
 
-			// 8) Short hex pubkey (too short)
+			// 8) Short hex pubkey (partial data)
 			badPKShort := ev
-			badPKShort.PubKey = "deadbeef"
+			badPKShort.PubKey = nostr.PubKey{0xde, 0xad, 0xbe, 0xef} // only 4 bytes instead of 32
 			stpks, errpks := client.PublishWithAck(ctx, url, &badPKShort)
 			rejectedPKS := errpks == nil && stpks != nil && !stpks.Success
 			r.Add(report.Finding{
@@ -493,8 +509,8 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			})
 
 			// 9) Past timestamp skew policy (-48h)
-			past := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Timestamp(time.Now().Add(-48 * time.Hour).Unix()), Kind: gonostr.KindTextNote, Content: "secprobe past timestamp"}
-			if err := past.Sign(sk); err == nil {
+			past := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Timestamp(time.Now().Add(-48 * time.Hour).Unix()), Kind: nostr.KindTextNote, Content: "secprobe past timestamp"}
+			if err := past.Sign(skBytes); err == nil {
 				stp, errp := client.PublishWithAck(ctx, url, &past)
 				// Policy-dependent; treat acceptance as INCONCLUSIVE, rejection as PASS
 				rejectedP := errp == nil && stp != nil && !stp.Success
@@ -513,9 +529,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			}
 
 			// 10) Empty tag and too-long tag
-			emptyTag := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe empty tag"}
-			emptyTag.Tags = append(emptyTag.Tags, []string{})
-			if err := emptyTag.Sign(sk); err == nil {
+			emptyTag := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: "secprobe empty tag"}
+			emptyTag.Tags = append(emptyTag.Tags, nostr.Tag{})
+			if err := emptyTag.Sign(skBytes); err == nil {
 				ste, erre := client.PublishWithAck(ctx, url, &emptyTag)
 				rejectedE := erre == nil && ste != nil && !ste.Success
 				st := report.Inconclusive
@@ -531,9 +547,9 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 					Active: true,
 				})
 			}
-			tooLongTag := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe long tag"}
-			tooLongTag.Tags = append(tooLongTag.Tags, []string{"x","1","2","3","4","5","6","7","8","9","10"})
-			if err := tooLongTag.Sign(sk); err == nil {
+			tooLongTag := nostr.Event{PubKey: pkBytes, CreatedAt: nostr.Now(), Kind: nostr.KindTextNote, Content: "secprobe long tag"}
+			tooLongTag.Tags = append(tooLongTag.Tags, nostr.Tag{"x","1","2","3","4","5","6","7","8","9","10"})
+			if err := tooLongTag.Sign(skBytes); err == nil {
 				stl, errl := client.PublishWithAck(ctx, url, &tooLongTag)
 				// Policy varies; treat rejection as PASS
 				rejectedL := errl == nil && stl != nil && !stl.Success

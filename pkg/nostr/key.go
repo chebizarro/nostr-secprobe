@@ -4,16 +4,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 // GenerateKeyPair returns hex-encoded seckey and pubkey.
 func GenerateKeyPair() (secHex string, pubHex string, err error) {
-	// go-nostr v0.52 provides string helpers
-	sk := gonostr.GeneratePrivateKey()
-	pk, err := gonostr.GetPublicKey(sk)
-	if err != nil { return "", "", err }
-	return sk, pk, nil
+	// fiatjaf.com/nostr provides Generate() and GetPublicKey()
+	sk := nostr.Generate()
+	pk := nostr.GetPublicKey(sk)
+	return sk.Hex(), pk.Hex(), nil
 }
 
 // RandHex returns n random bytes hex-encoded.
