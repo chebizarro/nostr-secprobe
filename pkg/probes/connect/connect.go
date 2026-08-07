@@ -6,8 +6,8 @@ import (
 
 	"encoding/hex"
 	"bytes"
-	"nostr-secprobe/internal/report"
-	icrypto "nostr-secprobe/internal/crypto"
+	icrypto "git.sharegap.net/cascadia/nostr-secprobe/pkg/crypto"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 )
 
 type Options struct {

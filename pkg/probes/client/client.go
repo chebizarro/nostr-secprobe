@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"nostr-secprobe/internal/report"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"

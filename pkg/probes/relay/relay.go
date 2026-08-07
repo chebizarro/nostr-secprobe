@@ -10,9 +10,9 @@ import (
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 
-	nostrx "nostr-secprobe/internal/nostr"
-	"nostr-secprobe/internal/report"
-	"nostr-secprobe/pkg/logx"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/logx"
+	nostrx "git.sharegap.net/cascadia/nostr-secprobe/pkg/nostr"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 )
 
 type Options struct {

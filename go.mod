@@ -1,4 +1,4 @@
-module nostr-secprobe
+module git.sharegap.net/cascadia/nostr-secprobe
 
 go 1.24.1
 

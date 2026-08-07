@@ -10,12 +10,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"nostr-secprobe/internal/preview"
-	"nostr-secprobe/internal/probes/client"
-	"nostr-secprobe/internal/probes/connect"
-	"nostr-secprobe/internal/probes/relay"
-	"nostr-secprobe/internal/report"
-	"nostr-secprobe/pkg/logx"
+	"git.sharegap.net/cascadia/nostr-secprobe/internal/preview"
+	"git.sharegap.net/cascadia/nostr-secprobe/internal/report"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/logx"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/probes/client"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/probes/connect"
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/probes/relay"
+	pkgreport "git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 )
 
 // version is populated at build time via -ldflags -X main.version=$TAG
@@ -295,7 +296,7 @@ func cmdReport() *cobra.Command {
 	return cmd
 }
 
-func writeReports(res *report.Results) error {
+func writeReports(res *pkgreport.Results) error {
 	// Write JSON
 	if flagOut != "" {
 		b, _ := json.MarshalIndent(res, "", "  ")

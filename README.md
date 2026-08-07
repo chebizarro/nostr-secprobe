@@ -64,6 +64,31 @@ docker run --rm ghcr.io/your-org/nostr-secprobe:latest --help
 ./nostr-secprobe probe connect --active --i-understand
 ```
 
+## Library usage
+
+Import the relay probe from `git.sharegap.net/cascadia/nostr-secprobe/pkg/probes/relay`:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "git.sharegap.net/cascadia/nostr-secprobe/pkg/probes/relay"
+)
+
+func main() {
+    results, err := relay.Run(context.Background(), relay.Options{
+        Targets: []string{"wss://relay.example"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("findings: %d", len(results.Findings))
+}
+```
+
 ## Probes (overview)
 
 - Relay
