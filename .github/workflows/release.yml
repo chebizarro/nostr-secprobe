@@ -319,32 +319,32 @@ jobs:
           URL_ARM64="https://github.com/${OWNER}/${NAME}/releases/download/${TAG}/${ARM64_FILE}"
           mkdir -p taprepo/Formula
           FORMULA_PATH=taprepo/Formula/nostr-secprobe.rb
-          printf '%s\n' \
-"class NostrSecprobe < Formula" \
-"  desc \"Probe Nostr relays and clients for known vulnerabilities\"" \
-"  homepage \"https://github.com/${OWNER}/${NAME}\"" \
-"  version \"${TAG}\"" \
-"" \
-"  on_macos do" \
-"    if Hardware::CPU.intel?" \
-"      url \"${URL_AMD64}\"" \
-"      sha256 \"${AMD64_SHA}\"" \
-"    end" \
-"    if Hardware::CPU.arm?" \
-"      url \"${URL_ARM64}\"" \
-"      sha256 \"${ARM64_SHA}\"" \
-"    end" \
-"  end" \
-"" \
-"  def install" \
-"    bin.install \"nostr-secprobe\"" \
-"  end" \
-"" \
-"  test do" \
-"    system \"#{bin}/nostr-secprobe\", \"--version\"" \
-"  end" \
-"end" \
-> "$FORMULA_PATH"
+          {
+            echo "class NostrSecprobe < Formula";
+            echo "  desc \"Probe Nostr relays and clients for known vulnerabilities\"";
+            echo "  homepage \"https://github.com/${OWNER}/${NAME}\"";
+            echo "  version \"${TAG}\"";
+            echo "";
+            echo "  on_macos do";
+            echo "    if Hardware::CPU.intel?";
+            echo "      url \"${URL_AMD64}\"";
+            echo "      sha256 \"${AMD64_SHA}\"";
+            echo "    end";
+            echo "    if Hardware::CPU.arm?";
+            echo "      url \"${URL_ARM64}\"";
+            echo "      sha256 \"${ARM64_SHA}\"";
+            echo "    end";
+            echo "  end";
+            echo "";
+            echo "  def install";
+            echo "    bin.install \"nostr-secprobe\"";
+            echo "  end";
+            echo "";
+            echo "  test do";
+            echo "    system \"#{bin}/nostr-secprobe\", \"--version\"";
+            echo "  end";
+            echo "end";
+          } > "$FORMULA_PATH"
 
       - name: Commit and push formula
         if: steps.check.outputs.skip == 'false'

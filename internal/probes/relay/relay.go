@@ -5,6 +5,8 @@ import (
 	"time"
 	"strings"
 	"sort"
+	"sync"
+	"math/rand"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 
@@ -23,6 +25,12 @@ type Options struct {
 	PubKeyHex   string
 	SecKeyHex   string
 	NoStore     bool
+	// Concurrency controls the number of in-flight publishes per target when bursting (default 1).
+	Concurrency int
+	// Backoff is a simple sleep applied after a failed publish attempt (default 0 = no backoff).
+	Backoff     time.Duration
+	// Retries controls how many times to retry a failed publish (with exponential backoff when Backoff>0).
+	Retries     int
 }
 
 func Run(ctx context.Context, opt Options) (*report.Results, error) {
@@ -187,25 +195,56 @@ func Run(ctx context.Context, opt Options) (*report.Results, error) {
 			// Create a query connection if available for timing queries
 			rx, rxErr := gonostr.RelayConnect(ctx, url)
 			if rxErr == nil { defer rx.Close() }
+			// Concurrency control
+			conc := opt.Concurrency
+			if conc <= 0 { conc = 1 }
+			sem := make(chan struct{}, conc)
+			var wg sync.WaitGroup
+			var mu sync.Mutex
 			for i := 0; i < burstN; i++ {
-				e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
-				if err := e.Sign(sk); err != nil { fails++; continue }
-				t0 := time.Now()
-				st, err := client.PublishWithAck(ctx, url, &e)
-				durs = append(durs, time.Since(t0))
-				if err != nil || st == nil || !st.Success { fails++ } else {
-					sent++
-					// Time a query-by-ID round-trip when we have a connection
+				sem <- struct{}{}
+				wg.Add(1)
+				go func() {
+					defer func() { <-sem; wg.Done() }()
+					// Build and sign event
+					e := gonostr.Event{PubKey: pk, CreatedAt: gonostr.Now(), Kind: gonostr.KindTextNote, Content: "secprobe burst"}
+					if err := e.Sign(sk); err != nil {
+						mu.Lock(); fails++; mu.Unlock();
+						return
+					}
+					// Publish with retries and backoff
+					var st *nostrx.Status
+					var perr error
+					var dur time.Duration
+					for attempt := 0; attempt <= opt.Retries; attempt++ {
+						t0 := time.Now()
+						st, perr = client.PublishWithAck(ctx, url, &e)
+						dur = time.Since(t0)
+						if perr == nil && st != nil && st.Success {
+							break
+						}
+						if opt.Backoff > 0 && attempt < opt.Retries {
+							sleep := opt.Backoff << attempt
+							jitter := 0.8 + rand.Float64()*0.4
+							time.Sleep(time.Duration(float64(sleep) * jitter))
+						}
+					}
+					if perr != nil || st == nil || !st.Success {
+						mu.Lock(); fails++; durs = append(durs, dur); mu.Unlock()
+						return
+					}
+					// Success path
+					mu.Lock(); sent++; durs = append(durs, dur); mu.Unlock()
 					if rxErr == nil {
 						ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 						qt0 := time.Now()
-						_, qerr := rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
+						_, _ = rx.QuerySync(ctx2, gonostr.Filter{IDs: []string{e.ID}})
 						cancel()
-						_ = qerr // treat any response time equally for now
-						qdurs = append(qdurs, time.Since(qt0))
+						mu.Lock(); qdurs = append(qdurs, time.Since(qt0)); mu.Unlock()
 					}
-				}
+				}()
 			}
+			wg.Wait()
 			// compute simple stats in milliseconds
 			ms := func(d time.Duration) float64 { return float64(d.Milliseconds()) }
 			var min, max time.Duration

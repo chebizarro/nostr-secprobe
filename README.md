@@ -8,10 +8,38 @@ A cross-platform Go CLI to test your own Nostr relays and clients for known vuln
 
 ## Install
 
+Pick one of the options below.
+
+### From source (Go)
 ```bash
 git clone https://github.com/your-org/nostr-secprobe
 cd nostr-secprobe
 go build ./cmd/nostr-secprobe
+./nostr-secprobe --version
+```
+
+### Prebuilt binaries (Releases)
+- Download the archive for your OS/arch from the GitHub Releases page.
+- Extract and run `nostr-secprobe` (or `nostr-secprobe.exe` on Windows).
+
+### Homebrew (macOS)
+```bash
+brew tap your-org/homebrew-tap
+brew install nostr-secprobe
+nostr-secprobe --version
+```
+
+### Scoop (Windows)
+```powershell
+scoop bucket add your-bucket https://github.com/your-org/scoop-bucket
+scoop install nostr-secprobe
+nostr-secprobe --version
+```
+
+### Docker (GHCR)
+```bash
+docker pull ghcr.io/your-org/nostr-secprobe:latest
+docker run --rm ghcr.io/your-org/nostr-secprobe:latest --help
 ```
 
 ## Quickstart
@@ -25,7 +53,8 @@ go build ./cmd/nostr-secprobe
 # Active checks (intrusive): replay/invalid-sig/malformed/rate/burst, latency percentiles
 ./nostr-secprobe probe relay \
   --targets wss://relay.example \
-  --active --i-understand
+  --active --i-understand \
+  --concurrency 4 --backoff 250ms --retries 2
 
 # Preview-probe (local)
 ./nostr-secprobe serve preview-probe --addr :8080 &
@@ -56,6 +85,56 @@ go build ./cmd/nostr-secprobe
   - Grouped sections per relay; severity and ACTIVE badges.
   - Dark mode and print-friendly CSS.
   - Checkbox to “Hide INCONCLUSIVE” cards.
+
+## Docker
+
+Build locally and run:
+
+```bash
+docker build -t ghcr.io/your-org/nostr-secprobe:dev .
+docker run --rm ghcr.io/your-org/nostr-secprobe:dev --help
+
+# Example relay probe from Docker
+docker run --rm ghcr.io/your-org/nostr-secprobe:dev \
+  probe relay --targets wss://relay.example --active --i-understand \
+  --concurrency 4 --backoff 250ms --retries 2
+```
+
+Published images (on tags) are available at `ghcr.io/<owner>/<repo>:<tag>` and `:latest`.
+
+## Config file (JSON)
+
+All common flags can be provided via a JSON config, then overridden by CLI flags:
+
+```json
+{
+  "targets": "wss://relay.example.org,wss://relay2.example.org",
+  "active": true,
+  "i_understand": true,
+  "rate": 5,
+  "max_events": 20,
+  "timeout": "1m",
+  "concurrency": 4,
+  "backoff": "250ms",
+  "retries": 2,
+  "log_level": "info",
+  "html": "report.html",
+  "out": "report.json"
+}
+```
+
+Run with:
+
+```bash
+./nostr-secprobe --config config.json probe relay
+```
+
+## Flags (selected)
+
+- `--concurrency` (int): in-flight publishes per target during bursts (default 1).
+- `--backoff` (duration): sleep after failed publish (e.g., `200ms`).
+- `--retries` (int): retry failed publishes up to N times with exponential backoff (if `--backoff` > 0).
+- `--config` (path): JSON file to load defaults from.
 
 ## ENV
 

@@ -37,6 +37,10 @@ var (
 	flagNoStore     bool
 	flagLogLevel    string
 	flagDryRun      bool
+	flagConcurrency int
+	flagBackoff     time.Duration
+	flagConfig      string
+	flagRetries     int
 )
 
 func main() {
@@ -61,12 +65,21 @@ func main() {
 	root.PersistentFlags().BoolVar(&flagNoStore, "no-store", false, "Do not store ephemeral private key on disk")
 	root.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level: debug,info,warn,error")
 	root.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "Print actions without network mutation")
+	root.PersistentFlags().IntVar(&flagConcurrency, "concurrency", 0, "In-flight publishes per target during bursts (default 1)")
+	root.PersistentFlags().DurationVar(&flagBackoff, "backoff", 0, "Sleep after failed publish (e.g., 200ms)")
+	root.PersistentFlags().IntVar(&flagRetries, "retries", 0, "Retry failed publish up to N times (exponential backoff if --backoff > 0)")
+	root.PersistentFlags().StringVar(&flagConfig, "config", env("NSEC_CONFIG", ""), "Path to JSON config file to load defaults from")
 
 	root.AddCommand(cmdProbeRelay())
 	root.AddCommand(cmdProbeClient())
 	root.AddCommand(cmdProbeConnect())
 	root.AddCommand(cmdServePreview())
 	root.AddCommand(cmdReport())
+
+	if err := loadConfigIfAny(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	if err := root.Execute(); err != nil {
 		if ee, ok := err.(exitError); ok {
@@ -76,6 +89,98 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(3)
 	}
+}
+
+// Config captures CLI-equivalent options for loading via --config JSON.
+type Config struct {
+	Targets      string        `json:"targets"`
+	Out          string        `json:"out"`
+	HTML         string        `json:"html"`
+	PDF          string        `json:"pdf"`
+	PreviewHost  string        `json:"preview_host"`
+	Active       bool          `json:"active"`
+	IUnderstand  bool          `json:"i_understand"`
+	Rate         int           `json:"rate"`
+	MaxEvents    int           `json:"max_events"`
+	Timeout      time.Duration `json:"timeout"`
+	PubKey       string        `json:"pubkey"`
+	SecKey       string        `json:"seckey"`
+	NoStore      bool          `json:"no_store"`
+	LogLevel     string        `json:"log_level"`
+	DryRun       bool          `json:"dry_run"`
+	Concurrency  int           `json:"concurrency"`
+	Backoff      time.Duration `json:"backoff"`
+	Retries      int           `json:"retries"`
+}
+
+func loadConfigIfAny() error {
+	if flagConfig == "" {
+		return nil
+	}
+	b, err := os.ReadFile(flagConfig)
+	if err != nil {
+		return err
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return err
+	}
+	// Apply only non-zero/non-empty values. Flags remain authoritative if provided.
+	if cfg.Targets != "" {
+		flagTargets = cfg.Targets
+	}
+	if cfg.Out != "" {
+		flagOut = cfg.Out
+	}
+	if cfg.HTML != "" {
+		flagHTML = cfg.HTML
+	}
+	if cfg.PDF != "" {
+		flagPDF = cfg.PDF
+	}
+	if cfg.PreviewHost != "" {
+		flagPreviewHost = cfg.PreviewHost
+	}
+	if cfg.Active {
+		flagActive = true
+	}
+	if cfg.IUnderstand {
+		flagIUnderstand = true
+	}
+	if cfg.Rate > 0 {
+		flagRate = cfg.Rate
+	}
+	if cfg.MaxEvents > 0 {
+		flagMaxEvents = cfg.MaxEvents
+	}
+	if cfg.Timeout > 0 {
+		flagTimeout = cfg.Timeout
+	}
+	if cfg.PubKey != "" {
+		flagPubKey = cfg.PubKey
+	}
+	if cfg.SecKey != "" {
+		flagSecKey = cfg.SecKey
+	}
+	if cfg.NoStore {
+		flagNoStore = true
+	}
+	if cfg.LogLevel != "" {
+		flagLogLevel = cfg.LogLevel
+	}
+	if cfg.DryRun {
+		flagDryRun = true
+	}
+	if cfg.Concurrency > 0 {
+		flagConcurrency = cfg.Concurrency
+	}
+	if cfg.Backoff > 0 {
+		flagBackoff = cfg.Backoff
+	}
+	if cfg.Retries > 0 {
+		flagRetries = cfg.Retries
+	}
+	return nil
 }
 
 func cmdProbeRelay() *cobra.Command {
@@ -100,6 +205,9 @@ func cmdProbeRelay() *cobra.Command {
 				PubKeyHex:   flagPubKey,
 				SecKeyHex:   flagSecKey,
 				NoStore:     flagNoStore,
+				Concurrency: flagConcurrency,
+				Backoff:     flagBackoff,
+				Retries:     flagRetries,
 			})
 			if err != nil {
 				return exitCodeErr(4, err)
