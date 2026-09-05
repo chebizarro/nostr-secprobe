@@ -3,7 +3,7 @@ module git.sharegap.net/cascadia/nostr-secprobe
 go 1.25
 
 require (
-	fiatjaf.com/nostr v0.0.0-20260731140316-a8080728893f
+	fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2
 	github.com/go-pdf/fpdf v0.9.0
 	github.com/spf13/cobra v1.8.0
 	golang.org/x/crypto v0.42.0
